@@ -1,0 +1,122 @@
+[
+  {
+    "id": "INC-0001",
+    "tipo": "ROBO_AGRAVADO",
+    "sector": "Barranco",
+    "severidad": "CRITICO",
+    "lat": -12.141819164062651,
+    "lon": -77.01820098037402,
+    "drone": "CNTL-03",
+    "eta_min": 1.46,
+    "roi": 0.7699,
+    "timestamp": "2026-05-07T11:20:55.451318"
+  },
+  {
+    "id": "INC-0002",
+    "tipo": "INCENDIO_ESTRUCTURAL",
+    "sector": "Miraflores",
+    "severidad": "CRITICO",
+    "lat": -12.115307303572964,
+    "lon": -77.02438502014475,
+    "drone": "CNTL-01",
+    "eta_min": 0.88,
+    "roi": 0.8301,
+    "timestamp": "2026-05-07T11:21:26.321484"
+  },
+  {
+    "id": "INC-0003",
+    "tipo": "INTRUSION_PERIMETRO",
+    "sector": "Miraflores",
+    "severidad": "CRITICO",
+    "lat": -12.12060078036223,
+    "lon": -77.02922751947239,
+    "drone": "CNTL-04",
+    "eta_min": 3.42,
+    "roi": 0.7309,
+    "timestamp": "2026-05-07T11:22:10.739786"
+  },
+  {
+    "id": "INC-0004",
+    "tipo": "INCENDIO_ESTRUCTURAL",
+    "sector": "Miraflores",
+    "severidad": "CRITICO",
+    "lat": -12.117829789114511,
+    "lon": -77.02565635965637,
+    "drone": "CNTL-02",
+    "eta_min": 4.49,
+    "roi": 0.6719,
+    "timestamp": "2026-05-07T11:22:40.138020"
+  },
+  {
+    "id": "INC-0005",
+    "tipo": "AGLOMERACION_SOSPECHOSA",
+    "sector": "Surquillo",
+    "severidad": "MEDIO",
+    "lat": -12.110522170513983,
+    "lon": -77.01965799031687,
+    "drone": "CNTL-06",
+    "eta_min": 5.54,
+    "roi": 0.6107,
+    "timestamp": "2026-05-07T11:23:17.524698"
+  },
+  {
+    "id": "INC-0006",
+    "tipo": "PERSONA_SOSPECHOSA",
+    "sector": "Miraflores",
+    "severidad": "MEDIO",
+    "lat": -12.118766913016485,
+    "lon": -77.02811201458428,
+    "drone": "CNTL-05",
+    "eta_min": 11.83,
+    "roi": 0.5976,
+    "timestamp": "2026-05-07T11:24:02.598422"
+  },
+  {
+    "id": "INC-0007",
+    "tipo": "INTRUSION_PERIMETRO",
+    "sector": "Lince",
+    "severidad": "CRITICO",
+    "lat": -12.083306853945214,
+    "lon": -77.02883837629405,
+    "drone": "SIN DISPONIBLE",
+    "eta_min": 0.0,
+    "roi": 0.0,
+    "timestamp": "2026-05-07T11:24:34.466033"
+  },
+  {
+    "id": "INC-0008",
+    "tipo": "INCENDIO_ESTRUCTURAL",
+    "sector": "Barranco",
+    "severidad": "CRITICO",
+    "lat": -12.147438955541746,
+    "lon": -77.01697347539417,
+    "drone": "SIN DISPONIBLE",
+    "eta_min": 0.0,
+    "roi": 0.0,
+    "timestamp": "2026-05-07T11:25:15.713724"
+  },
+  {
+    "id": "INC-0009",
+    "tipo": "INTRUSION_PERIMETRO",
+    "sector": "San Isidro",
+    "severidad": "CRITICO",
+    "lat": -12.101093435338449,
+    "lon": -77.03490596912633,
+    "drone": "SIN DISPONIBLE",
+    "eta_min": 0.0,
+    "roi": 0.0,
+    "timestamp": "2026-05-07T11:25:53.122866"
+  },
+  {
+    "id": "INC-0010",
+    "tipo": "ROBO_AGRAVADO",
+    "sector": "Barranco",
+    "severidad": "CRITICO",
+    "lat": -12.151136900092437,
+    "lon": -77.02138728308,
+    "drone": "SIN DISPONIBLE",
+    "eta_min": 0.0,
+    "roi": 0.0,
+    "timestamp": "2026-05-07T11:26:33.970160"
+  }
+]

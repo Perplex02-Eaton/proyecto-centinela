@@ -1,0 +1,6 @@
+# PROYECTO CENTINELA — EATON DYNAMICS
+# Python 3.11+
+# Instalar con: pip install -r requirements.txt
+
+rich>=13.7.0
+numpy>=1.26.0
