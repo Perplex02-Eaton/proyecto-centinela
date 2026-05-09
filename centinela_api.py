@@ -15,7 +15,7 @@ Endpoints:
   POST /analizar/{id}  — Análisis táctico individual con IA
 """
 
-import math, time, random, os, json, re
+import math, time, random, os, json, re, hashlib, hmac
 from datetime import datetime
 from typing import Optional
 from collections import deque
@@ -26,7 +26,7 @@ import pybullet as pb
 import pybullet_data
 import numpy as np
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -36,6 +36,8 @@ from pydantic import BaseModel
 # ─────────────────────────────────────────────────────────────────────────────
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Secret HMAC compartido con centinela_drone_agent (uplink Pi 5 → ground)
+HMAC_SECRET = os.getenv("CENTINELA_HMAC", "centinela-shared-secret").encode()
 NUM_DRONES    = 6
 REF_LAT       = -12.0464
 REF_LON       = -77.0428
@@ -595,6 +597,59 @@ async def historial_despachos():
         "total":     len(despachos),
         "timestamp": datetime.now().isoformat(),
     }
+
+
+@app.post("/api/drones/{drone_id}/telemetry", tags=["Telemetría"],
+          summary="Recibe telemetría firmada HMAC del drone (Pi 5 → ground)")
+async def post_drone_telemetry(drone_id: str, request: Request):
+    """
+    Endpoint llamado por centinela_drone_agent.UplinkClient.
+
+    Verifica HMAC-SHA256 sobre el body crudo usando el header
+    X-Centinela-Signature. El secret se configura via env var
+    CENTINELA_HMAC (debe coincidir con el agent; default
+    "centinela-shared-secret" para dev).
+
+    Frames con header X-Centinela-Replay=1 son re-envíos del buffer
+    offline del agent — se aceptan y procesan igual.
+    """
+    body = await request.body()
+    sig  = request.headers.get("X-Centinela-Signature", "")
+    expected = hmac.new(HMAC_SECRET, body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(status_code=401, detail="Invalid HMAC signature")
+
+    try:
+        frame = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    is_replay   = request.headers.get("X-Centinela-Replay") == "1"
+    received_at = time.time()
+    threat_val  = float(frame.get("threat", 0.0) or 0.0)
+
+    with estado.lock:
+        estado.telemetria[drone_id] = {
+            "ts":          frame.get("ts", received_at),
+            "state":       frame.get("state", {}) or {},
+            "pi_health":   frame.get("pi_health", {}) or {},
+            "detections":  frame.get("detections", []) or [],
+            "threat":      threat_val,
+            "notes":       frame.get("notes", "") or "",
+            "received_at": received_at,
+            "replay":      is_replay,
+        }
+        if threat_val >= 60:
+            estado.alert_log.appendleft({
+                "drone":  drone_id,
+                "tipo":   "DRONE_THREAT_HIGH",
+                "threat": threat_val,
+                "ts":     received_at,
+                "hora":   datetime.now().strftime("%H:%M:%S"),
+            })
+
+    return {"ok": True, "drone_id": drone_id, "received_at": received_at,
+            "replay": is_replay}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

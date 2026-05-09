@@ -23,6 +23,8 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 
+from centinela_threat import AccionesAutomaticas, AUTO_DEPLOY_ENABLED
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +117,31 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CALLBACK AUTO-DEPLOY (TS ≥ 85)
+# ─────────────────────────────────────────────────────────────────────────────
+
+AUTO_DEPLOY_HOLD_S = 30.0   # mantener INTERCEPT forzado tras un disparo
+
+def _deploy_all_drones(ts: float, nivel: str) -> None:
+    """Disparado por AccionesAutomaticas cuando TS≥85 y AUTO_DEPLOY_ENABLED.
+    Marca todos los drones en INTERCEPT por AUTO_DEPLOY_HOLD_S segundos
+    e inyecta un evento de auditoría en el feed de incidentes."""
+    st.session_state.auto_deploy_until = time.time() + AUTO_DEPLOY_HOLD_S
+    for did in st.session_state.drones_state:
+        st.session_state.drones_state[did]["mode"]  = "INTERCEPT"
+        st.session_state.drones_state[did]["alert"] = "ALTO"
+    st.session_state.incidentes.appendleft({
+        "hora":     datetime.now().strftime("%H:%M:%S"),
+        "emoji":    "🤖",
+        "tipo":     f"AUTO-DEPLOY (TS {ts:.0f})",
+        "sev":      "CRÍTICO",
+        "distrito": "SISTEMA",
+        "drone":    "TODOS",
+    })
+    st.session_state.alertas_total += 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DATOS SIMULADOS — Estado del sistema
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -173,6 +200,9 @@ if "mc_tick" not in st.session_state:
     st.session_state.start_time     = time.time()
     st.session_state.drones_state   = {}
     st.session_state.riesgos        = {}
+    st.session_state.acciones_auto  = AccionesAutomaticas(
+        on_emergency_deploy=_deploy_all_drones)
+    st.session_state.auto_deploy_until = 0.0
 
 st.session_state.mc_tick += 1
 tick = st.session_state.mc_tick
@@ -192,7 +222,9 @@ ts_raw = min(100, ts_raw + random.gauss(0, 3))
 threat_score = round(ts_raw, 1)
 st.session_state.ts_history.append(threat_score)
 
-# Estado drones
+# Estado drones — durante hold de auto-deploy todos quedan en INTERCEPT/ALTO
+forced_mode  = "INTERCEPT" if st.session_state.auto_deploy_until > time.time() else None
+forced_alert = "ALTO"      if forced_mode else None
 for d in DRONES_CONFIG:
     did = d["id"]
     prev = st.session_state.drones_state.get(did, {"bat":100.0,"alt":80.0})
@@ -204,8 +236,8 @@ for d in DRONES_CONFIG:
         "alt":    round(alt, 1),
         "vel":    round(random.uniform(6, 14), 1),
         "rssi":   random.randint(-85, -45),
-        "mode":   random.choice(["PATROL","PATROL","PATROL","HOVER","INTERCEPT"]),
-        "alert":  random.choice(["NOMINAL","NOMINAL","NOMINAL","MEDIO","ALTO"]),
+        "mode":   forced_mode  or random.choice(["PATROL","PATROL","PATROL","HOVER","INTERCEPT"]),
+        "alert":  forced_alert or random.choice(["NOMINAL","NOMINAL","NOMINAL","MEDIO","ALTO"]),
     }
 
 # Generar incidente ocasional
@@ -252,6 +284,9 @@ def risk_color(r):
 tc  = ts_color(threat_score)
 tnv = ts_nivel(threat_score)
 
+# Evaluar acciones automáticas — dispara _deploy_all_drones si TS≥85 y ENV=1
+st.session_state.acciones_auto.evaluar({"ts": threat_score, "nivel": tnv})
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -284,7 +319,7 @@ st.markdown(f"""
 # FILA 1 — MÉTRICAS SUPERIORES
 # ─────────────────────────────────────────────────────────────────────────────
 
-m1,m2,m3,m4,m5,m6,m7,m8 = st.columns(8)
+m1,m2,m3,m4,m5,m6,m7,m8,m9 = st.columns(9)
 
 riesgos_vals = list(st.session_state.riesgos.values())
 dist_criticos = sum(1 for r in riesgos_vals if r >= 0.60)
@@ -293,6 +328,13 @@ bat_promedio  = sum(st.session_state.drones_state[d["id"]]["bat"]
                     for d in DRONES_CONFIG) / 6
 drones_patrol = sum(1 for d in DRONES_CONFIG
                     if st.session_state.drones_state[d["id"]]["mode"] == "PATROL")
+
+ad_count  = len(st.session_state.acciones_auto.deploy_log)
+ad_active = st.session_state.auto_deploy_until > time.time()
+ad_color  = "#FF1744" if ad_active else "#FF9800" if ad_count else "#4CAF50"
+ad_label  = "AUTO-DEPLOY ●" if ad_active else (
+            "AUTO-DEPLOY"   if AUTO_DEPLOY_ENABLED else "AUTO-DEPLOY (off)")
+ad_value  = f"{ad_count}{'/HOLD' if ad_active else ''}"
 
 metrics = [
     (m1, f"{threat_score:.1f}", "THREAT SCORE", tc),
@@ -303,6 +345,7 @@ metrics = [
     (m6, f"{bat_promedio:.0f}%","BAT PROMEDIO", "#FF9800" if bat_promedio<50 else "#4CAF50"),
     (m7, str(st.session_state.alertas_total), "ALERTAS HOY","#FF9800"),
     (m8, f"{uptime:.0f}s",      "UPTIME",       "#6B7280"),
+    (m9, ad_value,              ad_label,       ad_color),
 ]
 
 for col, val, lbl, color in metrics:
