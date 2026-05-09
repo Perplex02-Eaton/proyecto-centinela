@@ -1,0 +1,11 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# SQLite — local database state
+centinela.db
+
+# Runtime outputs (regenerated por los módulos)
+reportes/auto_deploys.json
+reportes/incidentes_log.json
