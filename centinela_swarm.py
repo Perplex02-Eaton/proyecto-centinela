@@ -8,7 +8,7 @@ Arquitectura nivel Anduril/Lattice OS:
   - Mesh network: cada drone es nodo de comunicación
   - Multi-situación: cada drone detecta independientemente
   - Coordinador Opus 4.7: estrategia de enjambre completa
-  - Failsafe: RTH automático si señal perdida > 5s
+  - Failsafe: RTH automático si señal perdida > 1.5s (EMERGENCY si > 3s)
 
 Protocolos implementados:
   HEARTBEAT    → latido cada 1s (si cesa = failsafe)
@@ -42,13 +42,16 @@ from rich.align import Align
 
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-NUM_DRONES   = 6
-HMAC_SECRET  = b"CENTINELA-EATON-DYNAMICS-2026-SECURE"
-TICK_DT      = 0.1    # segundos por tick
-HEARTBEAT_HZ = 1.0    # Hz
-ORCA_RADIUS  = 8.0    # metros - radio de evitación
-MAX_VEL      = 15.0   # m/s velocidad máxima
-FAILSAFE_T   = 5.0    # segundos sin heartbeat → RTH
+NUM_DRONES        = 6
+HMAC_SECRET       = b"CENTINELA-EATON-DYNAMICS-2026-SECURE"
+TICK_DT           = 0.1     # segundos por tick (lazo principal 10 Hz)
+HEARTBEAT_HZ      = 1.0     # Hz
+ORCA_RADIUS       = 8.0     # metros - radio de evitación normal
+ORCA_HARD_RADIUS  = 4.0     # metros - frenado de emergencia inmediato
+ORCA_TICK_DT      = 0.05    # 50 ms — colisión revisada a 20 Hz → reacción <100ms
+MAX_VEL           = 15.0    # m/s velocidad máxima de patrulla
+MAX_VEL_RTH_EMERG = 20.0    # m/s velocidad de RTH en EMERGENCY
+FAILSAFE_T        = 1.5     # segundos sin heartbeat → RTH (antes 5.0)
 
 # Lima GPS
 REF_LAT      = -12.0464
@@ -273,6 +276,34 @@ class DroneAgent:
                 fy  += (dy/dist) * f
         return fx, fy
 
+    def step_collision_check(self, otros: list[DroneState]) -> bool:
+        """
+        Lazo rápido de colisión (20 Hz / 50 ms) — independiente del step() principal.
+        Si hay un drone dentro de ORCA_HARD_RADIUS, frena al 20% y aplica
+        repulsión doble inmediatamente. Garantiza reacción < 100 ms.
+        Retorna True si activó freno de emergencia.
+        """
+        s = self.state
+        if s.mode in (DroneMode.LANDED, DroneMode.GROUND):
+            return False
+        for otro in otros:
+            if otro.drone_id == s.drone_id:
+                continue
+            dx = s.x - otro.x
+            dy = s.y - otro.y
+            dist = math.sqrt(dx*dx + dy*dy)
+            if 0 < dist < ORCA_HARD_RADIUS:
+                s.vx *= 0.2
+                s.vy *= 0.2
+                fx, fy = self.calcular_orca(otros)
+                s.vx += fx * 2.0
+                s.vy += fy * 2.0
+                # Aplicar el delta inmediato — no esperar al próximo step()
+                s.x += s.vx * ORCA_TICK_DT
+                s.y += s.vy * ORCA_TICK_DT
+                return True
+        return False
+
     def step(self, otros: list[DroneState]) -> dict:
         """Avanza un tick del drone."""
         self.tick += 1
@@ -285,9 +316,10 @@ class DroneAgent:
             self._hb_timer = 0.0
             s.last_hb = time.time()
 
-        # ── FAILSAFE: RTH si sin heartbeat ──
-        if time.time() - s.last_hb > FAILSAFE_T:
-            s.mode = DroneMode.RTH
+        # ── FAILSAFE: RTH si sin heartbeat (EMERGENCY si la pérdida es prolongada) ──
+        hb_age = time.time() - s.last_hb
+        if hb_age > FAILSAFE_T and s.mode not in (DroneMode.RTH, DroneMode.EMERGENCY):
+            s.mode = DroneMode.EMERGENCY if hb_age > FAILSAFE_T * 2 else DroneMode.RTH
             s.target_x = 0.0
             s.target_y = 0.0
             s.target_z = 30.0
@@ -346,11 +378,12 @@ class DroneAgent:
             if v > 0.5:
                 s.yaw = math.degrees(math.atan2(s.vy, s.vx)) % 360
 
-        elif s.mode == DroneMode.RTH:
+        elif s.mode in (DroneMode.RTH, DroneMode.EMERGENCY):
+            spd_max = MAX_VEL_RTH_EMERG if s.mode == DroneMode.EMERGENCY else MAX_VEL
             dx   = 0 - s.x; dy = 0 - s.y
             dist = math.sqrt(dx**2+dy**2)
             if dist > 5.0:
-                spd  = min(MAX_VEL, dist*0.5)
+                spd  = min(spd_max, dist*0.5)
                 s.vx = (dx/dist)*spd
                 s.vy = (dy/dist)*spd
                 s.x += s.vx*TICK_DT
@@ -847,7 +880,7 @@ def main():
     stats   = {"total_msgs":0,"valid_msgs":0}
 
     try:
-        with Live(console=console, refresh_per_second=6, screen=True) as live:
+        with Live(console=console, refresh_per_second=6) as live:
             while True:
                 tick += 1
 
@@ -867,7 +900,14 @@ def main():
 
                 # Render
                 live.update(build_dashboard(agentes,coord,meta,sec,tick,stats))
-                time.sleep(TICK_DT)
+
+                # Sub-tick a 20 Hz: chequeo de colisión inminente
+                # (reacción < 100 ms ante aproximaciones dentro de ORCA_HARD_RADIUS)
+                time.sleep(ORCA_TICK_DT)
+                estados_mid = [ag.state for ag in agentes]
+                for ag in agentes:
+                    ag.step_collision_check(estados_mid)
+                time.sleep(TICK_DT - ORCA_TICK_DT)
 
     except KeyboardInterrupt:
         console.print(f"\n[bold {AMBER}]◈ CENTINELA SWARM DETENIDO.[/]")

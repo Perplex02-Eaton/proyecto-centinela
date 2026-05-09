@@ -627,7 +627,7 @@ def main():
     historial_pred: deque = deque(maxlen=10)
 
     try:
-        with Live(console=console, refresh_per_second=2, screen=True) as live:
+        with Live(console=console, refresh_per_second=2) as live:
             while True:
                 tick += 1
                 now  = time.time()

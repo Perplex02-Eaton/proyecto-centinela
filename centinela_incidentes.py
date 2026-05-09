@@ -13,13 +13,28 @@ Cadena de respuesta:
   8. ML update → predicción actualizada por sector
 """
 
-import os, time, math, random, json, re
+import os, time, math, random, json, re, asyncio
 from datetime import datetime
 from collections import deque
 from typing import Optional
 import urllib.request
 import urllib.parse
 import anthropic
+
+try:
+    from anthropic import AsyncAnthropic
+    HAS_ASYNC_ANTHROPIC = True
+except ImportError:
+    HAS_ASYNC_ANTHROPIC = False
+
+# Cliente AsyncAnthropic singleton (lazy)
+_async_client: Optional["AsyncAnthropic"] = None
+
+def _get_async_client():
+    global _async_client
+    if _async_client is None and ANTHROPIC_KEY and HAS_ASYNC_ANTHROPIC:
+        _async_client = AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    return _async_client
 
 from rich import box as rbox
 from rich.console import Console
@@ -281,118 +296,38 @@ def enviar_telegram(msg: str) -> bool:
 # CADENA DE RESPUESTA — Procesamiento con IA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ejecutar_cadena(inc: Incidente, live, build_fn, historial, stats):
-    """
-    Ejecuta la cadena completa de respuesta al incidente.
-    Cada paso actualiza el dashboard en tiempo real.
-    """
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
+def _safe_text(resp) -> str:
+    """Extrae texto de una respuesta de Claude defendiendo contra content vacío."""
+    try:
+        if not resp or not getattr(resp, "content", None):
+            return ""
+        for block in resp.content:
+            if hasattr(block, "text") and block.text:
+                return block.text.strip()[:100]
+    except Exception:
+        pass
+    return ""
 
-    # ── PASO 1: VISIÓN IA ──
+
+async def _llm_call(client, model: str, prompt: str, max_tokens: int, fallback: str) -> tuple:
+    """Una llamada Claude async con timing. Retorna (texto, tiempo_ms)."""
     t0 = time.time()
-    time.sleep(0.3)
-    if client:
-        try:
-            r = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=150,
-                messages=[{"role":"user","content":
-                    f"Incidente en Lima: {inc.tipo} en {inc.sector}. "
-                    f"Descripción: {inc.descripcion}. "
-                    f"Como sistema de visión de drone, describe en 1 oración lo que la cámara captaría. "
-                    f"Sé específico y táctico."
-                }],
-            )
-            vision_txt = r.content[0].text.strip()[:100]
-        except:
-            vision_txt = f"Cámara detecta {inc.descripcion[:60]}"
-    else:
-        vision_txt = f"Cámara detecta {inc.descripcion[:60]}"
+    if not client:
+        return fallback, int((time.time()-t0)*1000)
+    try:
+        resp = await client.messages.create(
+            model=model, max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        txt = _safe_text(resp) or fallback
+        return txt, int((time.time()-t0)*1000)
+    except Exception:
+        return fallback, int((time.time()-t0)*1000)
 
-    inc.cadena["vision"] = {
-        "estado": "✅",
-        "texto":  vision_txt,
-        "tiempo_ms": int((time.time()-t0)*1000),
-    }
-    live.update(build_fn(inc, historial, stats))
-    time.sleep(0.2)
 
-    # ── PASO 2: AGENTE TÁCTICO ──
-    t0 = time.time()
-    if client:
-        try:
-            r = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=100,
-                messages=[{"role":"user","content":
-                    f"Incidente {inc.tipo} severidad {inc.severidad} en {inc.sector} Lima. "
-                    f"Como agente táctico, en exactamente 1 oración: evalúa la amenaza y recomienda nivel de respuesta."
-                }],
-            )
-            agente_txt = r.content[0].text.strip()[:100]
-        except:
-            agente_txt = f"Amenaza {inc.severidad} confirmada. Respuesta inmediata requerida."
-    else:
-        agente_txt = f"Amenaza {inc.severidad} confirmada. Respuesta inmediata requerida."
-
-    inc.cadena["agente"] = {
-        "estado": "✅",
-        "texto":  agente_txt,
-        "tiempo_ms": int((time.time()-t0)*1000),
-    }
-    live.update(build_fn(inc, historial, stats))
-    time.sleep(0.2)
-
-    # ── PASO 3: COORDINADOR OPUS 4.7 ──
-    t0 = time.time()
-    if client:
-        try:
-            r = client.messages.create(
-                model="claude-opus-4-7",
-                max_tokens=120,
-                messages=[{"role":"user","content":
-                    f"Coordinador flota Lima. Incidente: {inc.tipo} en {inc.sector}. "
-                    f"Severidad: {inc.severidad}. Drones requeridos: {inc.drones_req}. "
-                    f"En 1 oración: orden táctica de coordinación de flota."
-                }],
-            )
-            coord_txt = r.content[0].text.strip()[:100]
-        except:
-            coord_txt = f"Activar protocolo {inc.severidad}. Despachar {inc.drones_req} drone(s) a {inc.sector}."
-    else:
-        coord_txt = f"Activar protocolo {inc.severidad}. Despachar {inc.drones_req} drone(s) a {inc.sector}."
-
-    inc.cadena["coordinador"] = {
-        "estado": "✅",
-        "texto":  coord_txt,
-        "tiempo_ms": int((time.time()-t0)*1000),
-    }
-    live.update(build_fn(inc, historial, stats))
-    time.sleep(0.2)
-
-    # ── PASO 4: DESPACHO ROI ──
-    t0 = time.time()
-    drone_id, roi, eta = flota.despachar(inc)
-    inc.drone_asignado  = drone_id or "SIN DISPONIBLE"
-    inc.roi_score       = roi
-    inc.eta_min         = eta
-
-    dispatch_txt = (
-        f"{drone_id} → {inc.sector} | ROI={roi:.3f} | ETA={eta:.1f}min"
-        if drone_id else "Sin drones disponibles"
-    )
-    inc.cadena["despacho"] = {
-        "estado": "✅" if drone_id else "⚠️",
-        "texto":  dispatch_txt,
-        "tiempo_ms": int((time.time()-t0)*1000),
-    }
-    live.update(build_fn(inc, historial, stats))
-    time.sleep(0.2)
-
-    # ── PASO 5: TELEGRAM ──
-    t0 = time.time()
-    sev_emoji = {"CRITICO":"🔴","ALTO":"🟠","MEDIO":"🟡","BAJO":"🟢"}.get(inc.severidad,"⚪")
-    msg = (
+def _build_telegram_msg(inc: "Incidente") -> str:
+    sev_emoji = {"CRITICO":"🔴","ALTO":"🟠","MEDIO":"🟡","BAJO":"🟢"}.get(inc.severidad, "⚪")
+    return (
         f"{inc.emoji} <b>CENTINELA — INCIDENTE DETECTADO</b>\n\n"
         f"{sev_emoji} <b>Tipo:</b> {inc.tipo}\n"
         f"📍 <b>Sector:</b> {inc.sector}\n"
@@ -404,17 +339,92 @@ def ejecutar_cadena(inc: Incidente, live, build_fn, historial, stats):
         f"🕐 <b>Hora:</b> {inc.timestamp.strftime('%H:%M:%S')}\n\n"
         f"<i>ID: {inc.id} | CENTINELA — EATON DYNAMICS</i>"
     )
-    ok = enviar_telegram(msg)
-    inc.cadena["telegram"] = {
-        "estado": "✅" if ok else "⚠️",
-        "texto":  f"{'Enviado a Eaton Palacin' if ok else 'Sin conexión'} ({inc.id})",
+
+
+def _persistir_log(registro: dict) -> str:
+    """Bloqueante (file I/O); se invoca via asyncio.to_thread."""
+    log_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "reportes", "incidentes_log.json"
+    )
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        try:
+            with open(log_path, "r") as f:
+                logs = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            logs = []
+        logs.append(registro)
+        with open(log_path, "w") as f:
+            json.dump(logs[-100:], f, indent=2)
+        return f"Guardado en incidentes_log.json ({len(logs)} registros)"
+    except Exception:
+        return f"Log en memoria ({registro.get('id','?')})"
+
+
+async def ejecutar_cadena(inc: Incidente, live, build_fn, historial, stats):
+    """
+    Cadena de respuesta async — paralelizada con asyncio.gather.
+    Latencia objetivo: <3s (vs ~13s del flujo secuencial anterior).
+
+    Layout temporal:
+      t=0     : disparo de 3 llamadas Claude en paralelo (vision/agente/coord)
+      t≈3s   : await gather → despacho ROI síncrono (<5ms)
+      t≈3s+ε : telegram + documentación en paralelo (no bloquean)
+    """
+    client = _get_async_client()
+    t_global = time.time()
+
+    # ── PASOS 1-3 EN PARALELO: Visión + Agente + Coordinador ──
+    p_vision = (
+        f"Incidente en Lima: {inc.tipo} en {inc.sector}. "
+        f"Descripción: {inc.descripcion}. "
+        f"Como sistema de visión de drone, describe en 1 oración lo que la cámara captaría. "
+        f"Sé específico y táctico."
+    )
+    p_agente = (
+        f"Incidente {inc.tipo} severidad {inc.severidad} en {inc.sector} Lima. "
+        f"Como agente táctico, en exactamente 1 oración: evalúa la amenaza y recomienda nivel de respuesta."
+    )
+    p_coord = (
+        f"Coordinador flota Lima. Incidente: {inc.tipo} en {inc.sector}. "
+        f"Severidad: {inc.severidad}. Drones requeridos: {inc.drones_req}. "
+        f"En 1 oración: orden táctica de coordinación de flota."
+    )
+    fb_vision = f"Cámara detecta {inc.descripcion[:60]}"
+    fb_agente = f"Amenaza {inc.severidad} confirmada. Respuesta inmediata requerida."
+    fb_coord  = f"Activar protocolo {inc.severidad}. Despachar {inc.drones_req} drone(s) a {inc.sector}."
+
+    (vision_txt, vision_ms), (agente_txt, agente_ms), (coord_txt, coord_ms) = await asyncio.gather(
+        _llm_call(client, "claude-sonnet-4-6", p_vision, 150, fb_vision),
+        _llm_call(client, "claude-sonnet-4-6", p_agente, 100, fb_agente),
+        _llm_call(client, "claude-opus-4-7",   p_coord,  120, fb_coord),
+    )
+
+    inc.cadena["vision"]      = {"estado":"✅","texto":vision_txt,"tiempo_ms":vision_ms}
+    inc.cadena["agente"]      = {"estado":"✅","texto":agente_txt,"tiempo_ms":agente_ms}
+    inc.cadena["coordinador"] = {"estado":"✅","texto":coord_txt, "tiempo_ms":coord_ms}
+    live.update(build_fn(inc, historial, stats))
+
+    # ── PASO 4: DESPACHO ROI (síncrono, <5ms) ──
+    t0 = time.time()
+    drone_id, roi, eta = flota.despachar(inc)
+    inc.drone_asignado = drone_id or "SIN DISPONIBLE"
+    inc.roi_score      = roi or 0.0
+    inc.eta_min        = eta or 0.0
+
+    inc.cadena["despacho"] = {
+        "estado": "✅" if drone_id else "⚠️",
+        "texto":  (f"{drone_id} → {inc.sector} | ROI={roi:.3f} | ETA={eta:.1f}min"
+                   if drone_id else "Sin drones disponibles"),
         "tiempo_ms": int((time.time()-t0)*1000),
     }
     live.update(build_fn(inc, historial, stats))
-    time.sleep(0.2)
 
-    # ── PASO 6: DOCUMENTACIÓN ──
-    t0 = time.time()
+    # ── PASOS 5-6 EN PARALELO: Telegram + Documentación ──
+    t_tel = time.time()
+    t_doc = time.time()
+    msg = _build_telegram_msg(inc)
     registro = {
         "id":        inc.id,
         "tipo":      inc.tipo,
@@ -427,38 +437,29 @@ def ejecutar_cadena(inc: Incidente, live, build_fn, historial, stats):
         "roi":       inc.roi_score,
         "timestamp": inc.timestamp.isoformat(),
     }
-    log_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "reportes", "incidentes_log.json"
+    ok, doc_txt = await asyncio.gather(
+        asyncio.to_thread(enviar_telegram, msg),
+        asyncio.to_thread(_persistir_log, registro),
     )
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    try:
-        try:
-            with open(log_path, "r") as f:
-                logs = json.load(f)
-        except:
-            logs = []
-        logs.append(registro)
-        with open(log_path, "w") as f:
-            json.dump(logs[-100:], f, indent=2)
-        doc_txt = f"Guardado en incidentes_log.json ({len(logs)} registros)"
-    except Exception as e:
-        doc_txt = f"Log en memoria ({inc.id})"
-
+    inc.cadena["telegram"] = {
+        "estado": "✅" if ok else "⚠️",
+        "texto":  f"{'Enviado a Eaton Palacin' if ok else 'Sin conexión'} ({inc.id})",
+        "tiempo_ms": int((time.time()-t_tel)*1000),
+    }
     inc.cadena["documentacion"] = {
         "estado": "✅",
         "texto":  doc_txt,
-        "tiempo_ms": int((time.time()-t0)*1000),
+        "tiempo_ms": int((time.time()-t_doc)*1000),
     }
     inc.resuelto = True
-    inc.tiempo_total_s = (datetime.now() - inc.timestamp).total_seconds()
+    inc.tiempo_total_s = time.time() - t_global
 
     # Actualizar stats
-    stats["total"]      += 1
-    stats["criticos"]   += 1 if inc.severidad == "CRITICO" else 0
-    stats["altos"]      += 1 if inc.severidad == "ALTO" else 0
-    stats["despachados"]+= 1 if drone_id else 0
-    stats["telegram"]   += 1 if ok else 0
+    stats["total"]       += 1
+    stats["criticos"]    += 1 if inc.severidad == "CRITICO" else 0
+    stats["altos"]       += 1 if inc.severidad == "ALTO" else 0
+    stats["despachados"] += 1 if drone_id else 0
+    stats["telegram"]    += 1 if ok else 0
     stats["tiempo_prom"] = (
         stats["tiempo_prom"] * (stats["total"]-1) + inc.tiempo_total_s
     ) / stats["total"]
@@ -624,16 +625,16 @@ def build_dashboard(inc_activo: Incidente, historial: deque, stats: dict) -> Tab
 # MAIN — Orquestador de simulación
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
+async def main():
     console.clear()
     console.print(Panel.fit(
         f"[bold {AMBER}]Inicializando CENTINELA INCIDENTES...[/]\n"
         f"[{BLUE}]Cargando catálogo: {len(CATALOGO_INCIDENTES)} tipos de incidente[/]\n"
-        f"[{DIM}]Cadena: Visión → Agente → Coordinador → Despacho → Telegram → Doc[/]",
+        f"[{DIM}]Cadena async paralela: gather(visión|agente|coord) → despacho → gather(telegram|doc)[/]",
         title="[bold white]EATON DYNAMICS — SIMULACIÓN DE INCIDENTES[/]",
         border_style=AMBER,
     ))
-    time.sleep(1.5)
+    await asyncio.sleep(1.5)
 
     historial: deque = deque(maxlen=20)
     stats = {
@@ -642,45 +643,43 @@ def main():
         "tiempo_prom":0.0,"prox":0.0,
     }
 
-    # Mensaje inicial Telegram
-    enviar_telegram(
+    # Mensaje inicial Telegram (no bloquea event loop)
+    await asyncio.to_thread(enviar_telegram,
         f"🎯 <b>CENTINELA INCIDENTES ACTIVADO</b>\n\n"
         f"Sistema de simulación en vivo iniciado.\n"
         f"📋 Catálogo: {len(CATALOGO_INCIDENTES)} tipos de incidente\n"
-        f"🤖 IA: Sonnet 4.6 + Opus 4.7\n"
+        f"🤖 IA: Sonnet 4.6 + Opus 4.7 (async paralelo)\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
         f"<i>Recibirás alertas por cada incidente detectado.</i>"
     )
 
-    # Primer incidente inmediato
     inc_actual = generar_incidente()
 
     try:
-        with Live(console=console, refresh_per_second=4, screen=True) as live:
+        with Live(console=console, refresh_per_second=4) as live:
             live.update(build_dashboard(inc_actual, historial, stats))
 
             while True:
-                # Procesar incidente actual
-                ejecutar_cadena(inc_actual, live,
+                # Procesar incidente actual (cadena async, ~3s con red)
+                await ejecutar_cadena(inc_actual, live,
                     lambda i,h,s: build_dashboard(i,h,s),
                     historial, stats)
 
-                # Pausa entre incidentes (15-35 segundos)
+                # Pausa entre incidentes (15-35s)
                 espera = random.uniform(15, 35)
                 fin_espera = time.time() + espera
-
                 while time.time() < fin_espera:
                     stats["prox"] = fin_espera - time.time()
                     live.update(build_dashboard(inc_actual, historial, stats))
-                    time.sleep(0.5)
+                    await asyncio.sleep(0.5)
 
                 # Nuevo incidente
                 inc_actual = generar_incidente()
                 stats["prox"] = 0.0
                 live.update(build_dashboard(inc_actual, historial, stats))
 
-    except KeyboardInterrupt:
-        enviar_telegram(
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        await asyncio.to_thread(enviar_telegram,
             f"🔴 <b>CENTINELA INCIDENTES DETENIDO</b>\n\n"
             f"📊 Incidentes procesados: {stats['total']}\n"
             f"🔴 Críticos: {stats['criticos']}\n"
@@ -690,7 +689,17 @@ def main():
         console.print(f"\n[bold {AMBER}]◈ SIMULACIÓN DETENIDA.[/]")
         console.print(f"  Incidentes procesados: {stats['total']}")
         console.print(f"  Tiempo promedio de cadena: {stats['tiempo_prom']:.1f}s")
+    finally:
+        # Cerrar cliente AsyncAnthropic limpiamente
+        if _async_client is not None:
+            try:
+                await _async_client.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

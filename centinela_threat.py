@@ -18,14 +18,16 @@ Niveles:
 
 Acciones automáticas por umbral:
   > 40  → Aumentar frecuencia de patrullaje
-  > 60  → Activar todos los drones disponibles
+  > 60  → Activar drones de reserva
   > 80  → Alerta Telegram CRÍTICA + reporte PDF automático
+  ≥ 85  → MODO EMERGENCIA — auto-deploy de TODOS los drones disponibles
+          (controlado por env var CENTINELA_AUTO_DEPLOY=1; default 0 / disabled)
 """
 
 import os, time, math, random, json
 from datetime import datetime
 from collections import deque
-from typing import Optional
+from typing import Optional, Callable
 import urllib.request, urllib.parse
 import anthropic
 
@@ -56,9 +58,12 @@ PESOS = {
 }
 
 # Umbrales de acción automática
-UMBRAL_VIGILANCIA = 40
-UMBRAL_CRISIS     = 60
-UMBRAL_EMERGENCIA = 80
+UMBRAL_VIGILANCIA      = 40
+UMBRAL_CRISIS          = 60
+UMBRAL_EMERGENCIA      = 80     # Telegram crítico + reporte PDF
+UMBRAL_EMERGENCIA_AUTO = 85     # Auto-deploy de TODOS los drones (sin operador)
+AUTO_DEPLOY_COOLDOWN   = 60     # segundos entre activaciones (anti-oscilación)
+AUTO_DEPLOY_ENABLED    = os.getenv("CENTINELA_AUTO_DEPLOY", "0") == "1"
 
 # Física
 NUM_DRONES    = 6
@@ -364,30 +369,109 @@ class ThreatScoreEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AccionesAutomaticas:
-    def __init__(self):
-        self._ultimo_40 = 0.0
-        self._ultimo_60 = 0.0
-        self._ultimo_80 = 0.0
-        self.log: deque = deque(maxlen=10)
+    """
+    Acciones automáticas por umbral.
+
+    Modo EMERGENCIA (TS ≥ 85): si AUTO_DEPLOY_ENABLED es True, dispara el
+    callback on_emergency_deploy(ts, nivel) sin esperar confirmación del
+    operador. Cada activación queda registrada en self.deploy_log y se
+    persiste en reportes/auto_deploys.json (audit trail). Anti-oscilación
+    garantizada por AUTO_DEPLOY_COOLDOWN.
+    """
+
+    def __init__(self, on_emergency_deploy: Optional[Callable[[float, str], None]] = None):
+        self._ultimo_40   = 0.0
+        self._ultimo_60   = 0.0
+        self._ultimo_80   = 0.0
+        self._ultimo_auto = 0.0
+        self._on_emergency_deploy = on_emergency_deploy
+        self.log: deque         = deque(maxlen=20)
+        self.deploy_log: deque  = deque(maxlen=50)
+
+    def _persist_deploy(self, entry: dict):
+        """Guarda el evento de auto-deploy en JSON (best-effort, no bloquea)."""
+        try:
+            log_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "reportes", "auto_deploys.json")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            try:
+                with open(log_path, "r") as f:
+                    logs = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                logs = []
+            logs.append(entry)
+            with open(log_path, "w") as f:
+                json.dump(logs[-200:], f, indent=2)
+        except Exception:
+            pass
 
     def evaluar(self, resultado: dict):
-        ts    = resultado["ts"]
-        nivel = resultado["nivel"]
+        # NoneType hardening — defaults defensivos en lugar de KeyError
+        ts    = float(resultado.get("ts", 0.0) or 0.0)
+        nivel = resultado.get("nivel", "?") or "?"
         now   = time.time()
 
+        # ── MODO EMERGENCIA: auto-deploy a TS ≥ 85 ──
+        if (AUTO_DEPLOY_ENABLED
+                and ts >= UMBRAL_EMERGENCIA_AUTO
+                and now - self._ultimo_auto > AUTO_DEPLOY_COOLDOWN):
+            self._ultimo_auto = now
+            entry = {
+                "iso":      datetime.now().isoformat(),
+                "ts_score": round(ts, 2),
+                "nivel":    nivel,
+                "trigger":  "AUTO_THRESHOLD_85",
+                "cooldown": AUTO_DEPLOY_COOLDOWN,
+            }
+            self.deploy_log.appendleft(entry)
+            self._persist_deploy(entry)
+
+            if self._on_emergency_deploy is not None:
+                try:
+                    self._on_emergency_deploy(ts, nivel)
+                except Exception as e:
+                    self.log.appendleft({
+                        "ts": ts, "accion": f"DEPLOY ERROR: {type(e).__name__}",
+                        "nivel": nivel,
+                        "hora": datetime.now().strftime("%H:%M:%S"),
+                    })
+
+            msg = (
+                f"🚨🚨🚨 <b>MODO EMERGENCIA — AUTO-DEPLOY</b> 🚨🚨🚨\n\n"
+                f"📊 <b>Score:</b> {ts:.1f}/100\n"
+                f"🔴 <b>Nivel:</b> {nivel}\n"
+                f"⚡ <b>Acción:</b> Todos los drones disponibles desplegados\n"
+                f"🤖 <b>Sin confirmación del operador</b> (umbral ≥ 85)\n"
+                f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+                f"<i>Evento registrado en auto_deploys.json</i>"
+            )
+            enviar_telegram(msg)
+            self.log.appendleft({
+                "ts": ts, "accion": "AUTO-DEPLOY", "nivel": nivel,
+                "hora": datetime.now().strftime("%H:%M:%S"),
+            })
+            return
+
+        # ── Tier 80 — Telegram crítico (sin auto-deploy) ──
         if ts >= UMBRAL_EMERGENCIA and now - self._ultimo_80 > 120:
             self._ultimo_80 = now
+            estado_auto = "ARMADO" if AUTO_DEPLOY_ENABLED else "DESHABILITADO (testing)"
             msg = (
                 f"🚨🚨 <b>THREAT SCORE CRÍTICO</b> 🚨🚨\n\n"
                 f"📊 <b>Score:</b> {ts:.1f}/100\n"
                 f"🔴 <b>Nivel:</b> {nivel}\n"
-                f"⚡ <b>Acción:</b> TODOS LOS DRONES ACTIVADOS\n"
+                f"⚡ <b>Acción:</b> Drones activados\n"
                 f"📋 <b>Reporte PDF generado automáticamente</b>\n"
+                f"🤖 <b>Auto-deploy ≥85:</b> {estado_auto}\n"
                 f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
                 f"<i>CENTINELA — EATON DYNAMICS · Lima, Perú</i>"
             )
             enviar_telegram(msg)
-            self.log.appendleft({"ts":ts,"accion":"EMERGENCIA MAYOR","nivel":nivel,"hora":datetime.now().strftime("%H:%M:%S")})
+            self.log.appendleft({
+                "ts": ts, "accion": "EMERGENCIA MAYOR", "nivel": nivel,
+                "hora": datetime.now().strftime("%H:%M:%S"),
+            })
 
         elif ts >= UMBRAL_CRISIS and now - self._ultimo_60 > 90:
             self._ultimo_60 = now
@@ -399,11 +483,17 @@ class AccionesAutomaticas:
                 f"🕐 {datetime.now().strftime('%H:%M:%S')}"
             )
             enviar_telegram(msg)
-            self.log.appendleft({"ts":ts,"accion":"CRISIS ACTIVA","nivel":nivel,"hora":datetime.now().strftime("%H:%M:%S")})
+            self.log.appendleft({
+                "ts": ts, "accion": "CRISIS ACTIVA", "nivel": nivel,
+                "hora": datetime.now().strftime("%H:%M:%S"),
+            })
 
         elif ts >= UMBRAL_VIGILANCIA and now - self._ultimo_40 > 60:
             self._ultimo_40 = now
-            self.log.appendleft({"ts":ts,"accion":"Vigilancia elevada","nivel":nivel,"hora":datetime.now().strftime("%H:%M:%S")})
+            self.log.appendleft({
+                "ts": ts, "accion": "Vigilancia elevada", "nivel": nivel,
+                "hora": datetime.now().strftime("%H:%M:%S"),
+            })
 
 
 def enviar_telegram(msg: str) -> bool:
@@ -682,7 +772,7 @@ def main():
     )
 
     try:
-        with Live(console=console, refresh_per_second=3, screen=True) as live:
+        with Live(console=console, refresh_per_second=3) as live:
             while True:
                 tick += 1
                 resultado = engine.calcular()

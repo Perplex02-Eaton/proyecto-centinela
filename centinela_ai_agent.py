@@ -361,7 +361,7 @@ def main():
     }
 
     try:
-        with Live(console=console, refresh_per_second=6, screen=True) as live:
+        with Live(console=console, refresh_per_second=6) as live:
             while True:
                 tick += 1
                 telem, battery = physics_step(pb_client, pb_body, tick, battery)

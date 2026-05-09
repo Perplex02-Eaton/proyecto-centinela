@@ -506,7 +506,7 @@ def main():
         kpi[f"bat_{i}"] = 100.0
 
     try:
-        with Live(console=console, refresh_per_second=6, screen=True) as live:
+        with Live(console=console, refresh_per_second=6) as live:
             while True:
                 tick += 1
                 kpi["uptime"]  = time.time() - start_time

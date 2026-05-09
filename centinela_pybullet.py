@@ -467,7 +467,7 @@ def main():
     tick  = 0
 
     try:
-        with Live(console=console, refresh_per_second=8, screen=True) as live:
+        with Live(console=console, refresh_per_second=8) as live:
             while True:
                 tick += 1
                 telem      = drone.step()

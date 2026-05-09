@@ -885,7 +885,7 @@ async def centinela_master():
     )
 
     try:
-        with Live(console=console, refresh_per_second=4, screen=True) as live:
+        with Live(console=console, refresh_per_second=4) as live:
             while True:
                 tick += 1
                 kpi.tick()

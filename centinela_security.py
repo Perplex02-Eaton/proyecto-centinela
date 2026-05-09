@@ -17,7 +17,7 @@ Capas implementadas:
 Ejecutar: python centinela_security.py
 """
 
-import os, time, json, hashlib, hmac, base64, random, math
+import os, time, json, hashlib, hmac, base64, random, math, threading
 from datetime import datetime, timedelta
 from collections import deque
 from typing import Optional
@@ -355,6 +355,7 @@ class IDS:
         ("GEOFENCE_BREACH","Drone fuera del perímetro autorizado",    RED),
         ("ROGUE_DEVICE",   "SysID no registrado en whitelist",        RED),
         ("TIMING_ATTACK",  "Patrón de timing anómalo detectado",      AMBER),
+        ("TAMPER_DETECTED","Geofence/firma manipulado en runtime",    RED),
     ]
 
     def __init__(self):
@@ -364,63 +365,93 @@ class IDS:
         self.total_blq : int   = 0
         self._timer    : float = 0.0
         self._cada     : float = random.uniform(3, 8)
+        self._lock              = threading.RLock()
 
     def step(self, tick: int) -> Optional[dict]:
-        self._timer += TICK_DT
-        if self._timer < self._cada:
-            return None
+        with self._lock:
+            self._timer += TICK_DT
+            if self._timer < self._cada:
+                return None
 
-        self._timer  = 0.0
-        self._cada   = random.uniform(4, 12)
+            self._timer  = 0.0
+            self._cada   = random.uniform(4, 12)
 
-        tipo, desc, color = random.choice(self.TIPOS_ATAQUE)
-        ip_atacante = f"{random.randint(1,255)}.{random.randint(0,255)}." \
-                      f"{random.randint(0,255)}.{random.randint(1,254)}"
+            tipo, desc, color = random.choice(self.TIPOS_ATAQUE)
+            ip_atacante = f"{random.randint(1,255)}.{random.randint(0,255)}." \
+                          f"{random.randint(0,255)}.{random.randint(1,254)}"
 
-        bloqueado = random.random() < 0.92  # 92% tasa de bloqueo
-        self.total_det += 1
-        if bloqueado:
+            bloqueado = random.random() < 0.92  # 92% tasa de bloqueo
+            self.total_det += 1
+            if bloqueado:
+                self.total_blq += 1
+                self.bloqueados[ip_atacante] = time.time()
+
+            alerta = {
+                "hora":      datetime.now().strftime("%H:%M:%S"),
+                "tipo":      tipo,
+                "desc":      desc,
+                "ip":        ip_atacante,
+                "bloqueado": bloqueado,
+                "color":     color,
+                "tick":      tick,
+            }
+            self.alertas.appendleft(alerta)
+            return alerta
+
+    def registrar_externo(self, tipo: str, desc: str, color: str = RED) -> dict:
+        """Registro de alerta originada fuera del IDS (tamper, geofence, etc.). Thread-safe."""
+        with self._lock:
+            self.total_det += 1
             self.total_blq += 1
-            self.bloqueados[ip_atacante] = time.time()
-
-        alerta = {
-            "hora":      datetime.now().strftime("%H:%M:%S"),
-            "tipo":      tipo,
-            "desc":      desc,
-            "ip":        ip_atacante,
-            "bloqueado": bloqueado,
-            "color":     color,
-            "tick":      tick,
-        }
-        self.alertas.appendleft(alerta)
-        return alerta
+            alerta = {
+                "hora":      datetime.now().strftime("%H:%M:%S"),
+                "tipo":      tipo,
+                "desc":      desc,
+                "ip":        "internal",
+                "bloqueado": True,
+                "color":     color,
+                "tick":      -1,
+            }
+            self.alertas.appendleft(alerta)
+            return alerta
 
     @property
     def tasa_bloqueo(self) -> float:
-        return self.total_blq/max(1,self.total_det)
+        with self._lock:
+            return self.total_blq / max(1, self.total_det)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAPA 7 — GEOFENCE HARD-CODED
 # ─────────────────────────────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class _GeofenceParams:
+    """Parámetros del geofence — frozen para inmutabilidad en runtime."""
+    lat:          float
+    lon:          float
+    radius_km:    float
+    no_fly_zones: tuple   # tuple de (nombre, lat, lon, r_km) — inmutable
+
+
 class Geofence:
     """
-    Perímetro de operación hard-coded en firmware.
+    Perímetro de operación con parámetros firmados HMAC e inmutables en runtime.
 
-    NO puede ser modificado remotamente — requiere acceso físico al drone.
-    Esto previene que un atacante expanda el geofence mediante comando remoto.
+    Defensa en profundidad:
+      - _GeofenceParams es @dataclass(frozen=True) → no se puede mutar atributos.
+      - Los parámetros se firman con HMAC-SHA256 en __init__ y se verifican
+        en cada verificar(); cualquier manipulación del objeto en memoria rompe
+        la firma → emite TAMPER_DETECTED y fuerza RTH.
+      - El TRUE hardware-enforcement vive en el FCU (Pixhawk) vía
+        FENCE_ACTION=4 (RTL) configurado por centinela_drone_agent.py al boot.
+        Este módulo es la capa software complementaria.
 
     Zonas:
       OPERACIONAL: dentro del radio autorizado
       ADVERTENCIA: 80-100% del radio (alerta preventiva)
       VIOLACIÓN:   >100% del radio → RTH forzado inmediato
       EXCLUSIÓN:   zonas no-fly (aeropuertos, zonas militares)
-
-    No-fly zones Lima:
-      - Aeropuerto Jorge Chávez (Callao)
-      - Palacio de Gobierno (Lima Centro)
-      - Base Aérea Las Palmas (Surco)
     """
 
     NO_FLY_ZONES = [
@@ -429,32 +460,76 @@ class Geofence:
         {"nombre":"Base Aérea Las Palmas",  "lat":-12.1167,"lon":-77.0000,"r_km":2.0},
     ]
 
+    _SIGNING_KEY = b"CENTINELA-GEOFENCE-IMMUTABLE-2026-EATON"
+
     def __init__(self):
+        nfz = tuple(
+            (z["nombre"], z["lat"], z["lon"], z["r_km"])
+            for z in self.NO_FLY_ZONES
+        )
+        self._params = _GeofenceParams(
+            lat=GEOFENCE_LAT, lon=GEOFENCE_LON,
+            radius_km=GEOFENCE_R_KM, no_fly_zones=nfz,
+        )
+        self._signature = self._compute_signature(self._params)
         self.violaciones : deque = deque(maxlen=20)
         self.total_viol  : int   = 0
         self.rth_forzados: int   = 0
+        self.tamper_count: int   = 0
+
+    @classmethod
+    def _compute_signature(cls, p: _GeofenceParams) -> str:
+        raw = f"{p.lat}|{p.lon}|{p.radius_km}|{p.no_fly_zones}".encode()
+        return hmac.new(cls._SIGNING_KEY, raw, hashlib.sha256).hexdigest()
+
+    def _verify_integrity(self) -> bool:
+        return hmac.compare_digest(
+            self._compute_signature(self._params), self._signature)
 
     def verificar(self, drone_id: str, lat: float, lon: float) -> dict:
-        R = 6371.0
-        φ1 = math.radians(GEOFENCE_LAT); φ2 = math.radians(lat)
-        Δφ = math.radians(lat-GEOFENCE_LAT)
-        Δλ = math.radians(lon-GEOFENCE_LON)
-        a  = math.sin(Δφ/2)**2+math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
-        dist_km = R*2*math.atan2(math.sqrt(a),math.sqrt(1-a))
+        # ── Hardening: detectar manipulación de los parámetros en runtime ──
+        if not self._verify_integrity():
+            self.tamper_count += 1
+            entry = {
+                "hora":    datetime.now().strftime("%H:%M:%S"),
+                "drone":   drone_id or "?",
+                "dist_km": -1.0,
+                "pct":     -1.0,
+                "no_fly":  None,
+                "accion":  "TAMPER_RTH",
+            }
+            self.violaciones.appendleft(entry)
+            return {
+                "dentro":     False,
+                "dist_km":    -1.0,
+                "pct_radio":  -1.0,
+                "zona":       "TAMPER_DETECTED",
+                "no_fly":     None,
+                "rth":        True,
+                "tamper":     True,
+            }
 
-        pct       = dist_km / GEOFENCE_R_KM
-        violacion = dist_km > GEOFENCE_R_KM
+        p = self._params
+        R = 6371.0
+        φ1 = math.radians(p.lat); φ2 = math.radians(lat)
+        Δφ = math.radians(lat - p.lat)
+        Δλ = math.radians(lon - p.lon)
+        a  = math.sin(Δφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
+        dist_km = R*2*math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+        pct       = dist_km / p.radius_km
+        violacion = dist_km > p.radius_km
 
         # Verificar no-fly zones
         en_no_fly = None
-        for zona in self.NO_FLY_ZONES:
-            φ1n = math.radians(zona["lat"]); φ2n = math.radians(lat)
-            Δφn = math.radians(lat-zona["lat"])
-            Δλn = math.radians(lon-zona["lon"])
-            an  = math.sin(Δφn/2)**2+math.cos(φ1n)*math.cos(φ2n)*math.sin(Δλn/2)**2
-            d_n = R*2*math.atan2(math.sqrt(an),math.sqrt(1-an))
-            if d_n < zona["r_km"]:
-                en_no_fly = zona["nombre"]
+        for nombre, nlat, nlon, nr in p.no_fly_zones:
+            φ1n = math.radians(nlat); φ2n = math.radians(lat)
+            Δφn = math.radians(lat - nlat)
+            Δλn = math.radians(lon - nlon)
+            an  = math.sin(Δφn/2)**2 + math.cos(φ1n)*math.cos(φ2n)*math.sin(Δλn/2)**2
+            d_n = R*2*math.atan2(math.sqrt(an), math.sqrt(1-an))
+            if d_n < nr:
+                en_no_fly = nombre
                 violacion = True
                 break
 
@@ -464,8 +539,8 @@ class Geofence:
             entry = {
                 "hora":    datetime.now().strftime("%H:%M:%S"),
                 "drone":   drone_id,
-                "dist_km": round(dist_km,3),
-                "pct":     round(pct*100,1),
+                "dist_km": round(dist_km, 3),
+                "pct":     round(pct*100, 1),
                 "no_fly":  en_no_fly,
                 "accion":  "RTH FORZADO",
             }
@@ -473,11 +548,12 @@ class Geofence:
 
         return {
             "dentro":     not violacion,
-            "dist_km":    round(dist_km,3),
-            "pct_radio":  round(pct*100,1),
-            "zona":       "OPERACIONAL" if pct<0.8 else "ADVERTENCIA" if pct<1.0 else "VIOLACIÓN",
+            "dist_km":    round(dist_km, 3),
+            "pct_radio":  round(pct*100, 1),
+            "zona":       "OPERACIONAL" if pct < 0.8 else "ADVERTENCIA" if pct < 1.0 else "VIOLACIÓN",
             "no_fly":     en_no_fly,
             "rth":        violacion,
+            "tamper":     False,
         }
 
 
@@ -923,7 +999,7 @@ def main():
         last_token = tok
 
     try:
-        with Live(console=console, refresh_per_second=4, screen=True) as live:
+        with Live(console=console, refresh_per_second=4) as live:
             while True:
                 tick += 1
 
@@ -975,6 +1051,9 @@ def main():
                     gf  = geo_m.verificar(f"CNTL-{random.randint(1,6):02d}",lat,lon)
                     if gf["rth"]:
                         audit_m.registrar("GEOFENCE","VIOLACION","RTH_FORZADO",gf)
+                        if gf.get("tamper"):
+                            ids_m.registrar_externo("TAMPER_DETECTED",
+                                "Geofence params manipulados en runtime", RED)
 
                 # Failsafe
                 fs = fail_m.step()

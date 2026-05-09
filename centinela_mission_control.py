@@ -368,7 +368,7 @@ with col_gauge:
         )
         st.plotly_chart(fig_hist, use_container_width=True, config={"displayModeBar":False})
 
-# MAPA LIMA
+# MAPA LIMA — render offline con go.Scatter (evita tiles de cartocdn que requieren WARP/VPN)
 with col_mapa:
     st.markdown('<div class="panel-title">▸ MAPA TÁCTICO — 20 DISTRITOS LIMA METROPOLITANA</div>',
                 unsafe_allow_html=True)
@@ -383,11 +383,40 @@ with col_mapa:
         nivel = "CRÍTICO" if r>=0.60 else "ALTO" if r>=0.45 else "MEDIO" if r>=0.30 else "BAJO"
         texts.append(f"<b>{nombre}</b><br>Riesgo: {r:.0%}<br>Nivel: {nivel}")
 
+    # Costa del Pacífico (aproximada N→S) — referencia geográfica sin tile server externo
+    costa_lat = [-11.77,-11.85,-11.92,-12.00,-12.05,-12.08,-12.11,-12.13,
+                 -12.16,-12.19,-12.23,-12.28,-12.34]
+    costa_lon = [-77.18,-77.17,-77.15,-77.13,-77.12,-77.10,-77.07,-77.05,
+                 -77.03,-77.01,-76.95,-76.88,-76.79]
+
     fig_map = go.Figure()
-    fig_map.add_trace(go.Scattermap(
-        lat=lats, lon=lons,
+
+    # Océano Pacífico (polígono al oeste de la costa)
+    fig_map.add_trace(go.Scatter(
+        x=[-77.30] + costa_lon + [costa_lon[-1], -77.30],
+        y=[-11.75] + costa_lat + [-12.40,        -12.40],
+        fill="toself",
+        fillcolor="rgba(15,25,55,0.55)",
+        line=dict(color="rgba(0,0,0,0)", width=0),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+
+    # Línea de costa
+    fig_map.add_trace(go.Scatter(
+        x=costa_lon, y=costa_lat,
+        mode="lines",
+        line=dict(color="#374151", width=1.5),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+
+    # Distritos
+    fig_map.add_trace(go.Scatter(
+        x=lons, y=lats,
         mode="markers+text",
-        marker=dict(size=sizes, color=colors, opacity=0.85),
+        marker=dict(size=sizes, color=colors, opacity=0.85,
+                    line=dict(width=0.5, color="#FF9800")),
         text=[n[:10] for n in names],
         textposition="top right",
         textfont=dict(color="#FF9800", size=8),
@@ -396,14 +425,15 @@ with col_mapa:
         showlegend=False,
     ))
 
-    # Drones en el mapa
+    # Drones
     drone_lats = [-12.0464 + random.uniform(-0.05,0.05) for _ in DRONES_CONFIG]
     drone_lons = [-77.0428 + random.uniform(-0.05,0.05) for _ in DRONES_CONFIG]
-    fig_map.add_trace(go.Scattermap(
-        lat=drone_lats, lon=drone_lons,
+    fig_map.add_trace(go.Scatter(
+        x=drone_lons, y=drone_lats,
         mode="markers+text",
         marker=dict(size=14, color=[d["color"] for d in DRONES_CONFIG],
-                    symbol="circle", opacity=1.0),
+                    symbol="diamond", opacity=1.0,
+                    line=dict(width=1, color="#FFFFFF")),
         text=[d["id"] for d in DRONES_CONFIG],
         textposition="bottom right",
         textfont=dict(color="#FFFFFF", size=8),
@@ -412,10 +442,23 @@ with col_mapa:
     ))
 
     fig_map.update_layout(
-        map=dict(style="carto-darkmatter",
-                 center=dict(lat=-12.05, lon=-77.03), zoom=10),
         height=310, margin=dict(l=0,r=0,t=0,b=0),
-        paper_bgcolor="#111827",
+        paper_bgcolor="#111827", plot_bgcolor="#0A0A0F",
+        xaxis=dict(
+            range=[-77.25, -76.80],
+            showgrid=True, gridcolor="#1F2937", gridwidth=0.5,
+            zeroline=False, showline=True, linecolor="#1F2937",
+            tickfont=dict(color="#374151", size=7, family="monospace"),
+            title=None,
+        ),
+        yaxis=dict(
+            range=[-12.30, -11.85],
+            showgrid=True, gridcolor="#1F2937", gridwidth=0.5,
+            zeroline=False, showline=True, linecolor="#1F2937",
+            tickfont=dict(color="#374151", size=7, family="monospace"),
+            scaleanchor="x", scaleratio=1.0,
+            title=None,
+        ),
     )
     st.plotly_chart(fig_map, use_container_width=True, config={"displayModeBar":False})
 
